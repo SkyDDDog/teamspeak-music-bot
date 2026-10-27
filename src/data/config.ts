@@ -60,6 +60,20 @@ export interface VoiceDuckingConfig {
   volumePercent: number;
 }
 
+export const RECORDING_FORMATS = ["mp3", "wav", "ogg"] as const;
+export type RecordingFormat = (typeof RECORDING_FORMATS)[number];
+
+export interface RecordingConfig {
+  /** Allow starting/stopping recording via the `!record` chat command. */
+  chatCommandEnabled: boolean;
+  /** Container/codec for recorded files. */
+  outputFormat: RecordingFormat;
+  /** Directory (relative to cwd or absolute) where recordings are stored. */
+  recordingsDir: string;
+  /** Auto-delete recordings older than this many hours; 0 = keep forever. */
+  maxRetentionHours: number;
+}
+
 /**
  * Providers gated by `enabledProviders`. Not listed here:
  *  - "local"   → governed by the existing `localAudioEnabled` flag
@@ -121,6 +135,8 @@ export interface BotConfig {
   autoPauseOnEmpty: boolean;
   /** Lower music volume while voice from another client is being received. */
   voiceDucking: VoiceDuckingConfig;
+  /** Channel voice recording (other users' speech only). */
+  recording: RecordingConfig;
   idleTimeoutMinutes: number;
   /** Enable uploading and playback of server-stored local audio files. */
   localAudioEnabled: boolean;
@@ -187,6 +203,12 @@ export function getDefaultConfig(): BotConfig {
     voiceDucking: {
       enabled: false,
       volumePercent: 30,
+    },
+    recording: {
+      chatCommandEnabled: false,
+      outputFormat: "mp3",
+      recordingsDir: "recordings",
+      maxRetentionHours: 0,
     },
     idleTimeoutMinutes: 0,
     localAudioEnabled: true,
@@ -420,6 +442,39 @@ export function loadConfig(path: string): BotConfig {
           : defaults.voiceDucking.volumePercent,
     };
 
+    // recording → sanitize each sub-field; invalid shapes fall back to defaults
+    // (mirrors voiceDucking handling so a hand-edited config is always safe).
+    const rawRecording = partial.recording;
+    const partialRecording =
+      rawRecording !== null &&
+      typeof rawRecording === "object" &&
+      !Array.isArray(rawRecording)
+        ? (rawRecording as Partial<RecordingConfig>)
+        : {};
+    const rawRetention = partialRecording.maxRetentionHours;
+    const recording: RecordingConfig = {
+      chatCommandEnabled:
+        typeof partialRecording.chatCommandEnabled === "boolean"
+          ? partialRecording.chatCommandEnabled
+          : defaults.recording.chatCommandEnabled,
+      outputFormat: (RECORDING_FORMATS as readonly string[]).includes(
+        partialRecording.outputFormat as string,
+      )
+        ? (partialRecording.outputFormat as RecordingFormat)
+        : defaults.recording.outputFormat,
+      recordingsDir:
+        typeof partialRecording.recordingsDir === "string" &&
+        partialRecording.recordingsDir.trim()
+          ? partialRecording.recordingsDir
+          : defaults.recording.recordingsDir,
+      maxRetentionHours:
+        typeof rawRetention === "number" &&
+        Number.isFinite(rawRetention) &&
+        rawRetention >= 0
+          ? rawRetention
+          : defaults.recording.maxRetentionHours,
+    };
+
     // defaultPlatform → an explicit operator default (issue #126). Keep it only
     // when it names a KNOWN gateable provider that is ALSO currently enabled;
     // anything else (unknown value, disabled source, wrong type, missing) becomes
@@ -458,6 +513,7 @@ export function loadConfig(path: string): BotConfig {
       savedQueuesEnabled,
       playKeepsQueue,
       voiceDucking,
+      recording,
       defaultPlatform: defaultPlatformPref,
     };
   }

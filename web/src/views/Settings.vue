@@ -842,6 +842,108 @@
         </p>
       </div>
 
+      <div class="setting-row voice-ducking-volume">
+        <div class="setting-label">
+          <Icon icon="mdi:record-recorder" class="setting-icon" />
+          <div>
+            <div>录制格式</div>
+            <div class="voice-ducking-hint">MP3 兼容性最好；WAV 无损但文件大；OGG 保留原始语音质量。</div>
+          </div>
+        </div>
+        <div class="voice-ducking-controls">
+          <select v-model="recordingOutputFormat" class="input input-sm" :disabled="recordingSaving" aria-label="录制格式">
+            <option value="mp3">MP3</option>
+            <option value="wav">WAV</option>
+            <option value="ogg">OGG Opus</option>
+          </select>
+          <button class="btn-primary" :disabled="recordingSaving" @click="saveRecording">
+            {{ recordingSaving ? '保存中…' : '保存录制设置' }}
+          </button>
+        </div>
+      </div>
+
+      <label class="profile-toggle behavior-toggle">
+        <div class="profile-toggle-text">
+          <div class="profile-toggle-label">允许聊天命令录制</div>
+          <div class="profile-toggle-hint">开启后可在 TeamSpeak 频道使用 !record / !record stop（仅管理员）。关闭时只能在本页启停录制。</div>
+        </div>
+        <input
+          v-model="recordingChatCommandEnabled"
+          type="checkbox"
+          class="profile-toggle-switch"
+          :disabled="recordingSaving"
+          @change="saveRecording"
+        />
+      </label>
+
+      <div class="setting-row">
+        <div class="setting-label">
+          <Icon icon="mdi:clock-remove" class="setting-icon" />
+          <div>
+            <div>自动清理（小时）</div>
+            <div class="voice-ducking-hint">超过该时长的录制文件在下次停止录制时被删除；0 表示永久保留。</div>
+          </div>
+        </div>
+        <div class="voice-ducking-controls">
+          <input
+            v-model.number="recordingMaxRetentionHours"
+            type="number"
+            min="0"
+            step="1"
+            class="input input-sm"
+            style="max-width:80px"
+            :disabled="recordingSaving"
+            aria-label="录制文件保留小时数"
+          />
+          <button class="btn-primary" :disabled="recordingSaving" @click="saveRecording">保存</button>
+        </div>
+        <p
+          v-if="recordingMessage"
+          class="voice-ducking-message"
+          :class="`tone-${recordingMessageTone}`"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          {{ recordingMessage }}
+        </p>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-label">
+          <Icon icon="mdi:microphone-message" class="setting-icon" />
+          <div>
+            <div>按机器人启停录制</div>
+            <div class="voice-ducking-hint">录制频道内其他用户的说话内容（不含本机器人播放的音乐）。文件保存在服务器 recordings 目录。</div>
+          </div>
+        </div>
+      </div>
+      <div v-for="bot in store.bots" :key="`rec-${bot.id}`" class="recording-bot-row">
+        <span class="recording-bot-name">{{ bot.name }}</span>
+        <span v-if="recordingStates[bot.id]?.recording" class="recording-live">● 录制中 {{ formatDuration(recordingStates[bot.id]?.durationMs ?? 0) }}</span>
+        <span v-else-if="!bot.connected" class="recording-offline">未连接</span>
+        <div class="recording-bot-actions">
+          <button
+            v-if="recordingStates[bot.id]?.recording"
+            class="btn-sm"
+            @click="stopRecording(bot.id)"
+          >停止录制</button>
+          <button
+            v-else
+            class="btn-sm"
+            :disabled="!bot.connected"
+            @click="startRecording(bot.id)"
+          >开始录制</button>
+          <button class="btn-sm" @click="loadRecordings(bot.id)">刷新列表</button>
+        </div>
+        <ul v-if="recordingStates[bot.id]?.files?.length" class="recording-files">
+          <li v-for="f in recordingStates[bot.id].files" :key="f.name">
+            <a :href="`/api/bot/${bot.id}/recordings/${encodeURIComponent(f.name)}`" :download="f.name">{{ f.name }}</a>
+            <span class="recording-file-meta">{{ formatBytes(f.size) }} · {{ formatTime(f.createdAt) }}</span>
+          </li>
+        </ul>
+      </div>
+
       <label class="profile-toggle behavior-toggle">
         <div class="profile-toggle-text">
           <div class="profile-toggle-label">本地音频播放</div>
@@ -1676,6 +1778,108 @@ const localAudioEnabled = ref(true);
 const savedQueuesEnabled = ref(false);
 const playKeepsQueue = ref(false);
 
+// --- Channel voice recording settings ---
+const recordingChatCommandEnabled = ref(false);
+const recordingOutputFormat = ref<'mp3' | 'wav' | 'ogg'>('mp3');
+const recordingMaxRetentionHours = ref(0);
+const recordingSaving = ref(false);
+const recordingMessage = ref('');
+const recordingMessageTone = ref<'ok' | 'warn'>('ok');
+
+interface RecordingFileEntry { name: string; size: number; createdAt: number }
+interface RecordingBotState { recording: boolean; durationMs: number; files: RecordingFileEntry[] }
+const recordingStates = ref<Record<string, RecordingBotState>>({});
+
+function applyRecordingConfig(config: unknown) {
+  if (!config || typeof config !== 'object') return;
+  const value = config as {
+    chatCommandEnabled?: unknown;
+    outputFormat?: unknown;
+    maxRetentionHours?: unknown;
+  };
+  recordingChatCommandEnabled.value = value.chatCommandEnabled === true;
+  if (value.outputFormat === 'mp3' || value.outputFormat === 'wav' || value.outputFormat === 'ogg') {
+    recordingOutputFormat.value = value.outputFormat;
+  }
+  const hours = value.maxRetentionHours;
+  recordingMaxRetentionHours.value =
+    typeof hours === 'number' && Number.isFinite(hours) && hours >= 0 ? hours : 0;
+}
+
+async function saveRecording() {
+  if (recordingSaving.value) return;
+  recordingSaving.value = true;
+  recordingMessage.value = '';
+  const submitted = {
+    chatCommandEnabled: recordingChatCommandEnabled.value,
+    outputFormat: recordingOutputFormat.value,
+    maxRetentionHours: Math.max(0, Number(recordingMaxRetentionHours.value) || 0),
+  };
+  try {
+    const res = await axios.post('/api/bot/settings', { recording: submitted });
+    applyRecordingConfig(res.data?.recording ?? submitted);
+    recordingMessageTone.value = 'ok';
+    recordingMessage.value = '已保存';
+  } catch {
+    recordingMessageTone.value = 'warn';
+    recordingMessage.value = '保存失败，请稍后重试';
+  } finally {
+    recordingSaving.value = false;
+  }
+}
+
+async function loadRecordings(botId: string) {
+  try {
+    const res = await axios.get(`/api/bot/${botId}/recordings`);
+    recordingStates.value = {
+      ...recordingStates.value,
+      [botId]: {
+        recording: res.data.recording === true,
+        durationMs: res.data.durationMs ?? 0,
+        files: Array.isArray(res.data.files) ? res.data.files : [],
+      },
+    };
+  } catch {
+    // Ignore — the per-bot row just stays without state
+  }
+}
+
+async function startRecording(botId: string) {
+  try {
+    await axios.post(`/api/bot/${botId}/record/start`);
+    await loadRecordings(botId);
+  } catch (err) {
+    recordingMessageTone.value = 'warn';
+    recordingMessage.value = `开始录制失败：${(err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? '未知错误'}`;
+  }
+}
+
+async function stopRecording(botId: string) {
+  try {
+    await axios.post(`/api/bot/${botId}/record/stop`);
+    await loadRecordings(botId);
+  } catch (err) {
+    recordingMessageTone.value = 'warn';
+    recordingMessage.value = `停止录制失败：${(err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? '未知错误'}`;
+  }
+}
+
+function formatDuration(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  return `${m}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function formatBytes(size: number): string {
+  if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  if (size >= 1024) return `${(size / 1024).toFixed(0)} KB`;
+  return `${size} B`;
+}
+
+function formatTime(epochMs: number): string {
+  return new Date(epochMs).toLocaleString();
+}
+
 function normalizeVoiceDuckingVolume(): number {
   const raw = voiceDuckingVolumePercent.value as number | string;
   const value = raw === '' ? Number.NaN : Number(raw);
@@ -1718,6 +1922,7 @@ async function loadIdleTimeout() {
     store.savedQueuesEnabled = savedQueuesEnabled.value;
     applyGuestModeFromServer(res.data.guestMode);
     applyAdminGroupsFromServer(res.data.adminGroups);
+    applyRecordingConfig(res.data.recording);
     applySpotifyConfig(res.data.spotify);
     applyJellyfinConfig(res.data.jellyfin);
     if (Array.isArray(res.data.enabledProviders)) {
@@ -2351,6 +2556,10 @@ onMounted(() => {
   loadIdleTimeout(); // also populates the Spotify config form (same endpoint)
   loadSpotifyStatus();
   handleSpotifyRedirect();
+  // Recording state per bot (recording flag + file lists).
+  store.fetchBots().then(() => {
+    for (const bot of store.bots) loadRecordings(bot.id);
+  });
   if (session.isAdmin.value) {
     loadUsers();
     loadAudit();
@@ -2366,6 +2575,55 @@ onUnmounted(() => {
 </script>
 
 <style lang="scss" scoped>
+.recording-bot-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border-color, rgba(128, 128, 128, 0.25));
+}
+
+.recording-bot-name {
+  font-weight: 600;
+  min-width: 120px;
+}
+
+.recording-live {
+  color: #e5484d;
+  font-weight: 700;
+}
+
+.recording-offline {
+  opacity: 0.5;
+}
+
+.recording-bot-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.recording-files {
+  width: 100%;
+  list-style: none;
+  padding: 4px 0 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+
+  li {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    font-size: 13px;
+  }
+}
+
+.recording-file-meta {
+  opacity: 0.6;
+}
+
 .back-btn {
   display: flex;
   align-items: center;

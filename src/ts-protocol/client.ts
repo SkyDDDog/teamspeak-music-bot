@@ -71,11 +71,14 @@ export interface TS3TextMessage {
   invokerGroups: string[]; // sender's TS server-group ids; [] when not in view cache
 }
 
-/** Lightweight voice-packet signal used for activity detection. The encoded
- * payload is intentionally not forwarded beyond this protocol wrapper. */
+/** Lightweight voice-packet signal used for activity detection. `data` carries
+ * the raw Opus payload so consumers like the channel recorder can decode it;
+ * it is absent when payload forwarding is not needed. */
 export interface TS3VoiceActivity {
   clientId: number;
   codec: number;
+  /** Raw Opus payload of the packet, when requested via forwardVoiceData. */
+  data?: Uint8Array;
   /** Stable TeamSpeak identity when the sender is present in the client view. */
   clientUid?: string;
 }
@@ -118,6 +121,8 @@ export class TS3Client extends EventEmitter {
   private httpQuery: TS6HttpQuery | null = null;
   private udpErrorTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly voiceEndpointResolver = new TrackingVoiceEndpointResolver();
+  /** When true, voiceActivity events include the raw Opus payload (`data`). */
+  private forwardVoiceData = false;
 
   constructor(private options: TS3ClientOptions, logger: Logger) {
     super();
@@ -134,6 +139,15 @@ export class TS3Client extends EventEmitter {
   /** The detected (or forced) server protocol after connect(). */
   getServerProtocol(): ServerProtocol {
     return this.detectedProtocol;
+  }
+
+  /**
+   * Opt in to receiving the raw Opus payload on `voiceActivity` events
+   * (`TS3VoiceActivity.data`). Used by the channel recorder; left off
+   * otherwise so activity consumers stay metadata-only.
+   */
+  setForwardVoiceData(enabled: boolean): void {
+    this.forwardVoiceData = enabled;
   }
 
   /** TS6 HTTP Query client (available after connecting to a TS6 server). */
@@ -265,6 +279,9 @@ export class TS3Client extends EventEmitter {
       const activity: TS3VoiceActivity = {
         clientId: voice.clientId,
         codec: voice.codec,
+        // Forward the encoded payload only when a consumer (channel recorder)
+        // opted in, so ducking listeners keep the cheap metadata-only event.
+        ...(this.forwardVoiceData ? { data: voice.data } : {}),
         ...(clientUid ? { clientUid } : {}),
       };
       this.emit("voiceActivity", activity);

@@ -11,7 +11,7 @@ export interface ParsedCommand {
  * a one-line edit here. Everything not in this set is public.
  */
 export const ADMIN_COMMANDS = new Set([
-  "stop", "clear", "remove", "move", "vol", "mode",
+  "stop", "clear", "remove", "move", "vol", "mode", "record",
 ]);
 
 export function parseCommand(

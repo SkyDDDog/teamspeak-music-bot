@@ -23,6 +23,8 @@ import {
   type BotConfig,
   type SpotifyConfig,
   type VoiceDuckingConfig,
+  type RecordingConfig,
+  type RecordingFormat,
 } from "../data/config.js";
 import type { JellyfinPlaybackReporter } from "../music/jellyfin.js";
 import { BotProfileManager } from "./profile.js";
@@ -38,6 +40,14 @@ import { SpotifyController } from "../music/spotify/controller.js";
 import type { SpotifyTrackEndedEvent } from "../music/spotify/backend.js";
 import type { SpotifyOAuth } from "../music/spotify/spotify-oauth.js";
 import { VoiceDuckingController } from "./voice-ducking.js";
+import {
+  ChannelRecorder,
+  listRecordingFiles,
+  recordingFileName,
+  sweepOldRecordings,
+  type RecordedFile,
+  type RecordingHandle,
+} from "./channel-recorder.js";
 import {
   ManagedVoiceClientRegistry,
   type ManagedVoiceClientOwnerToken,
@@ -154,6 +164,7 @@ export class BotInstance extends EventEmitter {
   private tsClient: TS3Client;
   private player: AudioPlayer;
   private voiceDucking: VoiceDuckingController;
+  private recorder: ChannelRecorder;
   private managedVoiceClients: ManagedVoiceClientRegistry;
   private readonly configuredVoiceServerScope: ManagedVoiceClientScope;
   private voiceServerScope: ManagedVoiceClientScope;
@@ -223,6 +234,7 @@ export class BotInstance extends EventEmitter {
       this.player,
       this.config.voiceDucking ?? { enabled: false, volumePercent: 30 },
     );
+    this.recorder = new ChannelRecorder(this.logger);
     this.managedVoiceClients =
       options.managedVoiceClients ?? new ManagedVoiceClientRegistry();
     this.configuredVoiceServerScope = {
@@ -393,6 +405,7 @@ export class BotInstance extends EventEmitter {
       this.connected = false;
       this.unregisterManagedVoiceClient(MANAGED_VOICE_CLIENT_RELEASE_GRACE_MS);
       this.voiceDucking.reset(true);
+      this.stopRecording();
       // Cancel any pending live-queue snapshot BEFORE clearing the queue: a
       // debounced snapshot firing after clear() would persist an empty queue
       // (clearQueueState), wiping the state we want to restore on reconnect —
@@ -431,6 +444,11 @@ export class BotInstance extends EventEmitter {
         this.managedVoiceClients.has(this.voiceServerScope, activity.clientId)
       ) {
         return;
+      }
+      // Recording consumes the raw Opus payload when active (other humans only —
+      // managed bots are filtered above, and the bot's own music never arrives).
+      if (this.recorder.isRecording() && activity.data) {
+        this.recorder.handleVoicePacket(activity.data);
       }
       this.voiceDucking.handleVoiceActivity(activity.clientId);
     });
@@ -570,6 +588,9 @@ export class BotInstance extends EventEmitter {
   disconnect(): void {
     this._cancelIdleTimer();
     this.voiceDucking.reset(true);
+    // Finalize any in-progress channel recording so the ffmpeg child and its
+    // output file never outlive the connection.
+    this.stopRecording();
     // Cancel any pending live-queue snapshot before clearing so it can't fire
     // afterwards and persist an empty queue over the state we keep for restore
     // (#119). The disconnected handler cancels too, but do it here as well for
@@ -620,6 +641,87 @@ export class BotInstance extends EventEmitter {
   updateVoiceDucking(settings: VoiceDuckingConfig): void {
     this.config.voiceDucking = { ...settings };
     this.voiceDucking.updateSettings(settings);
+  }
+
+  // --- Channel voice recording (other users' speech only) ---
+
+  private recordingPrefix(): string {
+    return `bot-${this.id}`;
+  }
+
+  /** Resolve the configured recordings dir (relative to cwd or absolute). */
+  recordingsDir(): string {
+    return this.config.recording?.recordingsDir ?? "recordings";
+  }
+
+  /** Start recording channel speech. Throws when already recording or offline. */
+  startRecording(formatOverride?: RecordingFormat): RecordingHandle {
+    if (!this.connected) throw new Error("Bot is not connected to TeamSpeak");
+    const format = formatOverride ?? this.config.recording?.outputFormat ?? "mp3";
+    const file = path.join(this.recordingsDir(), recordingFileName(this.recordingPrefix(), format));
+    this.recorder.start(format, file);
+    // Payload forwarding is only enabled while recording so the ducking path
+    // stays metadata-only otherwise.
+    this.tsClient.setForwardVoiceData(true);
+    this.logger.info({ file, format }, "Channel recording started");
+    return { file, format, durationMs: 0 };
+  }
+
+  stopRecording(): RecordingHandle | null {
+    if (!this.recorder.isRecording()) return null;
+    const handle = this.recorder.stop();
+    this.tsClient.setForwardVoiceData(false);
+    if (handle) {
+      // Opportunistic retention sweep on every stop.
+      const hours = this.config.recording?.maxRetentionHours ?? 0;
+      if (hours > 0) {
+        const deleted = sweepOldRecordings(this.recordingsDir(), this.recordingPrefix(), hours);
+        if (deleted) this.logger.info({ deleted }, "Swept expired recordings");
+      }
+    }
+    return handle;
+  }
+
+  isRecording(): boolean {
+    return this.recorder.isRecording();
+  }
+
+  recordingDurationMs(): number {
+    return this.recorder.getDurationMs();
+  }
+
+  listRecordings(): RecordedFile[] {
+    return listRecordingFiles(this.recordingsDir(), this.recordingPrefix());
+  }
+
+  /** Hot-apply recording settings from the web UI. */
+  updateRecordingConfig(settings: RecordingConfig): void {
+    this.config.recording = { ...settings };
+  }
+
+  private cmdRecord(cmd: ParsedCommand): Promise<string> {
+    const cfg = this.config.recording;
+    const wantsStop = cmd.args.trim().toLowerCase() === "stop";
+    if (wantsStop) {
+      const handle = this.stopRecording();
+      return Promise.resolve(
+        handle
+          ? `⏹️ Recording stopped: ${path.basename(handle.file)} (${Math.round(handle.durationMs / 1000)}s)`
+          : "No recording in progress",
+      );
+    }
+    if (this.isRecording()) {
+      return Promise.resolve(`Already recording: ${this.recorder.currentFile()}`);
+    }
+    if (!cfg?.chatCommandEnabled) {
+      return Promise.resolve("Recording via chat command is disabled (enable it in the web settings).");
+    }
+    try {
+      this.startRecording();
+      return Promise.resolve("⚠️ Channel recording started — everyone speaking in this channel is being recorded.");
+    } catch (err) {
+      return Promise.resolve(`Error: ${(err as Error).message}`);
+    }
   }
 
   private _startIdlePoller(): void {
@@ -876,6 +978,8 @@ export class BotInstance extends EventEmitter {
         return this.cmdLoadQueue(cmd);
       case "queues":
         return this.cmdListQueues();
+      case "record":
+        return this.cmdRecord(cmd);
       case "help":
         return this.cmdHelp();
       default:
@@ -1863,6 +1967,9 @@ export class BotInstance extends EventEmitter {
         : []),
       `${p}vote         — Vote to skip`,
       `${p}lyrics       — Show lyrics`,
+      ...(this.config.recording?.chatCommandEnabled
+        ? [`${p}record [stop] — Start/stop channel voice recording (admin)`]
+        : []),
       `${p}now          — Current song info`,
       `${p}help         — This help message`,
     ].join("\n");

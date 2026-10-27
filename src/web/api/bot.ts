@@ -1,7 +1,9 @@
 import { Router } from "express";
+import { statSync } from "node:fs";
 import type { BotManager } from "../../bot/manager.js";
 import type { BotConfig, GuestModeConfig, SpotifyConfig, JellyfinConfig, GateableProvider } from "../../data/config.js";
-import { saveConfig, GATEABLE_PROVIDERS } from "../../data/config.js";
+import { saveConfig, GATEABLE_PROVIDERS, RECORDING_FORMATS } from "../../data/config.js";
+import { safeRecordingPath } from "../../bot/channel-recorder.js";
 import type { Logger } from "../../logger.js";
 import type { BotDatabase } from "../../data/database.js";
 import type { AvatarStore } from "../../data/avatars.js";
@@ -79,6 +81,7 @@ export function createBotRouter(
       guestMode: config.guestMode,
       spotify: maskedSpotify(),
       jellyfin: maskedJellyfin(),
+      recording: config.recording,
       enabledProviders: config.enabledProviders,
       defaultPlatform: config.defaultPlatform,
     });
@@ -206,6 +209,28 @@ export function createBotRouter(
       if (typeof jf.userId === "string") t.userId = jf.userId;
     }
 
+    // Partial-merge the recording block (same contract as voiceDucking): only
+    // strictly valid fields mutate the stored config; junk is ignored.
+    const rec = req.body?.recording;
+    const hasRecording = rec !== null && typeof rec === "object" && !Array.isArray(rec);
+    if (hasRecording) {
+      const t = config.recording;
+      if (typeof rec.chatCommandEnabled === "boolean") t.chatCommandEnabled = rec.chatCommandEnabled;
+      if ((RECORDING_FORMATS as readonly string[]).includes(rec.outputFormat)) {
+        t.outputFormat = rec.outputFormat;
+      }
+      if (typeof rec.recordingsDir === "string" && rec.recordingsDir.trim()) {
+        t.recordingsDir = rec.recordingsDir.trim();
+      }
+      if (
+        typeof rec.maxRetentionHours === "number" &&
+        Number.isFinite(rec.maxRetentionHours) &&
+        rec.maxRetentionHours >= 0
+      ) {
+        t.maxRetentionHours = rec.maxRetentionHours;
+      }
+    }
+
     // enabledProviders: full replace, known providers only (mirrors loadConfig).
     // An empty array is a valid "all gateable sources off". NOTE: the NetEase/QQ
     // sidecar API servers are only started at boot, so newly enabling those two
@@ -274,6 +299,7 @@ export function createBotRouter(
       if (hasIdle) bot.updateIdleTimeout(config.idleTimeoutMinutes);
       if (hasAutoPause) bot.updateAutoPause(config.autoPauseOnEmpty);
       if (hasVoiceDucking) bot.updateVoiceDucking(config.voiceDucking);
+      if (hasRecording) bot.updateRecordingConfig(config.recording);
     }
 
     res.json({
@@ -287,6 +313,7 @@ export function createBotRouter(
       guestMode: config.guestMode,
       spotify: maskedSpotify(),
       jellyfin: maskedJellyfin(),
+      recording: config.recording,
       enabledProviders: config.enabledProviders,
       defaultPlatform: config.defaultPlatform,
     });
@@ -460,6 +487,80 @@ export function createBotRouter(
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
+  });
+
+  // --- Channel voice recording ---
+
+  router.post("/:id/record/start", requirePermission("bot.manage"), requireBotAccess("id"), (req, res) => {
+    const bot = botManager.getBot(req.params.id);
+    if (!bot) {
+      res.status(404).json({ error: "Bot not found" });
+      return;
+    }
+    try {
+      const handle = bot.startRecording();
+      res.json({ success: true, file: handle.file, format: handle.format });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  router.post("/:id/record/stop", requirePermission("bot.manage"), requireBotAccess("id"), (req, res) => {
+    const bot = botManager.getBot(req.params.id);
+    if (!bot) {
+      res.status(404).json({ error: "Bot not found" });
+      return;
+    }
+    const handle = bot.stopRecording();
+    if (!handle) {
+      res.status(400).json({ error: "No recording in progress" });
+      return;
+    }
+    res.json({
+      success: true,
+      file: handle.file,
+      format: handle.format,
+      durationMs: handle.durationMs,
+    });
+  });
+
+  router.get("/:id/recordings", requirePermission("bot.manage"), requireBotAccess("id"), (req, res) => {
+    const bot = botManager.getBot(req.params.id);
+    if (!bot) {
+      res.status(404).json({ error: "Bot not found" });
+      return;
+    }
+    res.json({
+      recording: bot.isRecording(),
+      durationMs: bot.recordingDurationMs(),
+      files: bot.listRecordings(),
+    });
+  });
+
+  // Download a recording. Only plain basenames inside the recordings dir are
+  // served (safeRecordingPath rejects traversal / absolute / dot-dot names).
+  router.get("/:id/recordings/:file", requirePermission("bot.manage"), requireBotAccess("id"), (req, res) => {
+    const bot = botManager.getBot(req.params.id);
+    if (!bot) {
+      res.status(404).json({ error: "Bot not found" });
+      return;
+    }
+    const full = safeRecordingPath(bot.recordingsDir(), req.params.file);
+    if (!full) {
+      res.status(400).json({ error: "Invalid file name" });
+      return;
+    }
+    let size: number;
+    try {
+      size = statSync(full).size;
+    } catch {
+      res.status(404).json({ error: "File not found" });
+      return;
+    }
+    res.set("Content-Length", String(size));
+    res.download(full, req.params.file, (err) => {
+      if (err && !res.headersSent) res.status(500).json({ error: (err as Error).message });
+    });
   });
 
   return router;
