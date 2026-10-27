@@ -207,7 +207,9 @@ export function getDefaultConfig(): BotConfig {
     recording: {
       chatCommandEnabled: false,
       outputFormat: "mp3",
-      recordingsDir: "recordings",
+      // Under data/ so Docker deployments (volume at /app/data) persist
+      // recordings across container rebuilds.
+      recordingsDir: "data/recordings",
       maxRetentionHours: 0,
     },
     idleTimeoutMinutes: 0,
